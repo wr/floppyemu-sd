@@ -11,6 +11,26 @@ Read-only. Exit code 1 if any file is fragmented, 2 on errors.
 import struct
 import sys
 
+# File types FloppyEmu can load (from the FloppyEmu manual). Keep in sync
+# with emu_kind() in femu-sd.
+IMAGE_EXTS = {".dsk", ".do", ".po", ".nib", ".woz", ".2mg", ".hdv",  # Apple II
+              ".img", ".image", ".moof",                             # Mac/Lisa floppy
+              ".hda", ".iso", ".cdr", ".toast"}                      # Mac HD / CD-ROM
+ARCHIVE_EXTS = {".sit", ".hqx", ".bin", ".cpt", ".txt"}  # auto-"boxed" (<1.4 MB)
+NOT_ARCHIVES = {"favdisks.txt"}  # the Favorites menu config, not a disk
+
+
+def emu_kind(name: str) -> str:
+    """'image', 'archive', or '' for a file FloppyEmu won't load"""
+    low = name.lower()
+    base = low.rsplit("/", 1)[-1]
+    ext = "." + base.rsplit(".", 1)[-1] if "." in base else ""
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in ARCHIVE_EXTS and base not in NOT_ARCHIVES:
+        return "archive"
+    return ""
+
 
 def crack(dev: str) -> int:
     f = open(dev, "rb")
@@ -51,7 +71,7 @@ def crack(dev: str) -> int:
 
     def chain(first: int):
         out, c = [], first
-        while 2 <= c < END and len(out) < 4_000_000 // cluster_bytes + 16:
+        while 2 <= c < END and len(out) <= clusters:  # bound = cycle guard
             out.append(c)
             c = next_clus(c)
         return out
@@ -85,11 +105,16 @@ def crack(dev: str) -> int:
                 part = e[1:11] + e[14:26] + e[28:32]
                 lfn[e[0] & 0x1F] = part.decode("utf-16-le", "replace")
                 continue
-            if attr & 0x08:  # volume label
+            if attr & 0x08 or e[0] == 0x2E:  # volume label, or "." / ".."
                 lfn.clear()
                 continue
-            short = (e[0:8].decode("ascii", "replace").rstrip() + "." +
-                     e[8:11].decode("ascii", "replace").rstrip()).rstrip(".")
+            base = e[0:8].decode("ascii", "replace").rstrip()
+            ext = e[8:11].decode("ascii", "replace").rstrip()
+            if e[12] & 0x08:  # NT/macOS flag: 8.3 basename is lowercase
+                base = base.lower()
+            if e[12] & 0x10:  # ... extension is lowercase
+                ext = ext.lower()
+            short = f"{base}.{ext}" if ext else base
             name = "".join(lfn[k] for k in sorted(lfn)) if lfn else short
             name = name.split("\x00")[0].rstrip("￿")
             lfn.clear()
@@ -107,23 +132,49 @@ def crack(dev: str) -> int:
         f.seek((reserved + nfats * fatsz) * bps)
         rootdata = f.read(rootsectors * bps)
 
-    frag = 0
-    for name, first, size, is_dir in dir_entries(rootdata):
-        if is_dir or name in (".", "..") or name.startswith((".", "_")):
+    def walk(data: bytes, prefix: str, depth: int = 0):
+        """yield (path, first, size) for every file, recursing into subdirs"""
+        for name, first, size, is_dir in dir_entries(data):
+            if name.startswith((".", "_")):
+                continue
+            path = f"{prefix}{name}"
+            if is_dir:
+                if first and depth < 32:
+                    sub = b"".join(read_cluster(c) for c in chain(first))
+                    yield from walk(sub, path + "/", depth + 1)
+                continue
+            yield path, first, size
+
+    frag = skipped = 0
+    rows = []
+    for name, first, size in sorted(walk(rootdata, "")):
+        kind = emu_kind(name)
+        if not kind:
+            skipped += 1
             continue
         rr = runs(chain(first)) if first else []
         if len(rr) <= 1:
-            print(f"  CONTIGUOUS  {name}  ({size} bytes)")
+            rows.append(("CONTIGUOUS", name, size, ""))
         else:
             frag += 1
-            print(f"  FRAGMENTED  {name}  ({size} bytes, {len(rr)} extents)"
-                  f"  <-- FloppyEmu will refuse this")
+            why = ("FloppyEmu will refuse this" if kind == "image"
+                   else "FloppyEmu may refuse this archive")
+            rows.append(("FRAGMENTED", name, size,
+                         f"{len(rr)} extents  <-- {why}"))
+    # columns sized to the widest entry, 4 spaces apart (same as femu-sd list)
+    pw = max((len(r[1]) for r in rows), default=0)
+    sw = max((len(str(r[2])) for r in rows), default=0)
+    gap = " " * 4
+    for status, name, size, note in rows:
+        line = f"  {status}{gap}{name:<{pw}}{gap}{size:>{sw}} bytes"
+        print(f"{line}{gap}{note}" if note else line)
+    if skipped:
+        print(f"({skipped} other file(s) skipped - not a type FloppyEmu loads)")
     if frag:
         print(f"{frag} fragmented file(s). Fix: femu-sd repair")
         return 1
     print("all files contiguous - the FloppyEmu will be happy")
     return 0
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
